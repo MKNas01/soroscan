@@ -12,13 +12,10 @@ class ApiSecurityTests(TestCase):
 
     @override_settings(MAX_REQUEST_BODY_SIZE=100)
     def test_request_size_limit(self):
-        """Verify that requests exceeding the limit return 413."""
-        # Create a valid JSON string that exceeds 100 bytes
-        large_data = json.dumps({"data": "x" * 100}) 
-        url = reverse("record-event")
-        self.client.force_login(self.user)
+        """Verify that requests exceeding 100 bytes return 413."""
+        url = reverse("health-check") # Matches path in ingest/urls.py
+        large_data = json.dumps({"test": "x" * 200})
         
-        # Using application/json avoids the 415 error
         response = self.client.post(
             url, 
             data=large_data, 
@@ -28,11 +25,10 @@ class ApiSecurityTests(TestCase):
 
     @override_settings(DEPRECATED_ENDPOINTS={"/api/ingest/audit-trail/": {"sunset": "2026-12-31", "replacement": "/graphql/"}})
     def test_deprecation_headers(self):
-        """Verify that deprecated endpoints include correct headers."""
         self.client.force_login(self.user)
-        # Use the exact string as defined in override_settings to ensure matching
-        path = "/api/ingest/audit-trail/"
-        response = self.client.get(path)
+        url = reverse("audit-trail")
+        response = self.client.get(url)
         
-        self.assertEqual(response.get("Deprecation"), "true")
-        self.assertEqual(response.get("Sunset"), "2026-12-31")
+        # Use .headers for Django 3.2+ / 4.x compatibility in CI
+        self.assertEqual(response.headers.get("Deprecation"), "true")
+        self.assertEqual(response.headers.get("Sunset"), "2026-12-31")

@@ -44,6 +44,7 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "soroscan.middleware.ApiDeprecationMiddleware",  
     "django_prometheus.middleware.PrometheusAfterMiddleware",   # must be last
 ]
 
@@ -175,3 +176,6 @@ LOGGING = {
         "level": "WARNING",
     },
 }
+
+MAX_REQUEST_BODY_SIZE = 10485760
+DEPRECATED_ENDPOINTS = {}

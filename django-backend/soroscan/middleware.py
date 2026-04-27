@@ -121,16 +121,16 @@ class ApiDeprecationMiddleware:
 
     def __call__(self, request):
         response = self.get_response(request)
-        deprecated_paths = getattr(settings, "DEPRECATED_ENDPOINTS", {})
+        deprecated_endpoints = getattr(settings, "DEPRECATED_ENDPOINTS", {})
         
-        # Normalize paths by removing leading/trailing slashes for comparison
-        request_path = request.path.strip("/")
+        # Normalize request path: remove leading/trailing slashes
+        norm_request_path = request.path.strip("/")
         
-        for path, config in deprecated_paths.items():
-            if path.strip("/") == request_path:
+        for path, config in deprecated_endpoints.items():
+            # Normalize config path
+            if path.strip("/") == norm_request_path:
                 response["Deprecation"] = "true"
-                response["Sunset"] = config["sunset"]
-                response["Link"] = f'<{config["replacement"]}>; rel="replacement"'
+                response["Sunset"] = config.get("sunset", "")
+                response["Link"] = f'<{config.get("replacement", "")}>; rel="replacement"'
                 break
-                
         return response
