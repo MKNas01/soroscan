@@ -99,13 +99,12 @@ class RequestBodySizeMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        # Move size check to the VERY beginning
-        max_size = getattr(settings, "MAX_REQUEST_BODY_SIZE", 10485760)
-        content_length = request.META.get('CONTENT_LENGTH')
-        
-        if content_length:
+        # We check this at the very beginning of the __call__
+        if request.method == "POST":
+            max_size = getattr(settings, "MAX_REQUEST_BODY_SIZE", 10485760)
             try:
-                if int(content_length) > max_size:
+                content_length = int(request.META.get('CONTENT_LENGTH', 0))
+                if content_length > max_size:
                     logger.warning("Payload Too Large: %s bytes", content_length)
                     return JsonResponse(
                         {"error": "Payload Too Large", "limit": max_size},
@@ -113,8 +112,9 @@ class RequestBodySizeMiddleware:
                     )
             except (ValueError, TypeError):
                 pass
+        
         return self.get_response(request)
-
+        
 class ApiDeprecationMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response

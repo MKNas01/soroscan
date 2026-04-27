@@ -34,7 +34,8 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
-    "django_prometheus.middleware.PrometheusBeforeMiddleware",  # must be first
+    "django_prometheus.middleware.PrometheusBeforeMiddleware",
+    "soroscan.middleware.RequestBodySizeMiddleware", 
     "django.middleware.security.SecurityMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -44,8 +45,8 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    "soroscan.middleware.ApiDeprecationMiddleware",  
-    "django_prometheus.middleware.PrometheusAfterMiddleware",   # must be last
+    "soroscan.middleware.ApiDeprecationMiddleware",
+    "django_prometheus.middleware.PrometheusAfterMiddleware",
 ]
 
 ROOT_URLCONF = "soroscan.urls"  # use main urls.py which has the /metrics route
