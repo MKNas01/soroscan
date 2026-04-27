@@ -95,53 +95,42 @@ class SlowQueryMiddleware:
         return response
 
 class RequestBodySizeMiddleware:
-    """
-    Prevent accidental large requests by rejecting bodies > settings.MAX_REQUEST_BODY_SIZE.
-    Returns 413 Payload Too Large and logs the event.
-    """
     def __init__(self, get_response):
         self.get_response = get_response
-        self.max_size = getattr(settings, "MAX_REQUEST_BODY_SIZE", 10485760)
 
     def __call__(self, request):
+        # Move size check to the VERY beginning
+        max_size = getattr(settings, "MAX_REQUEST_BODY_SIZE", 10485760)
         content_length = request.META.get('CONTENT_LENGTH')
         
         if content_length:
             try:
-                if int(content_length) > self.max_size:
-                    logger.warning(
-                        "Payload Too Large: %s bytes from %s to %s",
-                        content_length,
-                        request.META.get('REMOTE_ADDR'),
-                        request.path
-                    )
+                if int(content_length) > max_size:
+                    logger.warning("Payload Too Large: %s bytes", content_length)
                     return JsonResponse(
-                        {"error": "Payload Too Large", "limit": self.max_size},
+                        {"error": "Payload Too Large", "limit": max_size},
                         status=413
                     )
             except (ValueError, TypeError):
                 pass
-
         return self.get_response(request)
 
 class ApiDeprecationMiddleware:
-    """
-    Injects Deprecation, Sunset, and Link headers for legacy endpoints defined in settings.
-    """
     def __init__(self, get_response):
         self.get_response = get_response
-        self.deprecated_paths = getattr(settings, "DEPRECATED_ENDPOINTS", {})
 
     def __call__(self, request):
         response = self.get_response(request)
+        deprecated_paths = getattr(settings, "DEPRECATED_ENDPOINTS", {})
         
-        # Check if the current path (or path with trailing slash) is deprecated
-        path = request.path
-        config = self.deprecated_paths.get(path) or self.deprecated_paths.get(path + "/")
+        # Normalize paths by removing leading/trailing slashes for comparison
+        request_path = request.path.strip("/")
         
-        if config:
-            response["Deprecation"] = "true"
-            response["Sunset"] = config["sunset"]
-            response["Link"] = f'<{config["replacement"]}>; rel="replacement"'
-            
+        for path, config in deprecated_paths.items():
+            if path.strip("/") == request_path:
+                response["Deprecation"] = "true"
+                response["Sunset"] = config["sunset"]
+                response["Link"] = f'<{config["replacement"]}>; rel="replacement"'
+                break
+                
         return response
