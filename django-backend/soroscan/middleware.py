@@ -7,9 +7,11 @@ import uuid
 
 from django.conf import settings
 from django.db import connection
+from django.http import JsonResponse
 
 from .log_context import set_request_id
 
+logger = logging.getLogger(__name__)
 slow_query_logger = logging.getLogger("soroscan.slow_queries")
 
 
@@ -90,4 +92,56 @@ class SlowQueryMiddleware:
             for name, value in headers.items():
                 response[name] = value
 
+        return response
+
+class RequestBodySizeMiddleware:
+    """
+    Prevent accidental large requests by rejecting bodies > settings.MAX_REQUEST_BODY_SIZE.
+    Returns 413 Payload Too Large and logs the event.
+    """
+    def __init__(self, get_response):
+        self.get_response = get_response
+        self.max_size = getattr(settings, "MAX_REQUEST_BODY_SIZE", 10485760)
+
+    def __call__(self, request):
+        content_length = request.META.get('CONTENT_LENGTH')
+        
+        if content_length:
+            try:
+                if int(content_length) > self.max_size:
+                    logger.warning(
+                        "Payload Too Large: %s bytes from %s to %s",
+                        content_length,
+                        request.META.get('REMOTE_ADDR'),
+                        request.path
+                    )
+                    return JsonResponse(
+                        {"error": "Payload Too Large", "limit": self.max_size},
+                        status=413
+                    )
+            except (ValueError, TypeError):
+                pass
+
+        return self.get_response(request)
+
+class ApiDeprecationMiddleware:
+    """
+    Injects Deprecation, Sunset, and Link headers for legacy endpoints defined in settings.
+    """
+    def __init__(self, get_response):
+        self.get_response = get_response
+        self.deprecated_paths = getattr(settings, "DEPRECATED_ENDPOINTS", {})
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        
+        # Check if the current path (or path with trailing slash) is deprecated
+        path = request.path
+        config = self.deprecated_paths.get(path) or self.deprecated_paths.get(path + "/")
+        
+        if config:
+            response["Deprecation"] = "true"
+            response["Sunset"] = config["sunset"]
+            response["Link"] = f'<{config["replacement"]}>; rel="replacement"'
+            
         return response
