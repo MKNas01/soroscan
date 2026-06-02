@@ -279,6 +279,9 @@ class TestContractEventViewSet:
 @pytest.mark.django_db
 class TestWebhookSubscriptionViewSet:
     def test_list_webhooks(self, authenticated_client, contract):
+        WebhookSubscriptionFactory(contract=contract, target_url="https://example.com/webhook-1")
+        WebhookSubscriptionFactory(contract=contract, target_url="https://example.com/webhook-2")
+        
         WebhookSubscriptionFactory.create_batch(2, contract=contract)
         url = reverse("webhook-list")
         response = authenticated_client.get(url)
