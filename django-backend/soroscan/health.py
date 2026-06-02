@@ -12,12 +12,9 @@ from rest_framework.response import Response
 from django.conf import settings
 
 from celery.exceptions import TimeoutError
-
 from soroscan.celery import app
 
 WORKER_HEALTH_TIMEOUT_SECONDS = 2
-
-
 PROCESS_START_TIME = time.monotonic()
 
 
