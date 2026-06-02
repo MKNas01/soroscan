@@ -1,7 +1,6 @@
 import time
 import pytest
 from django.conf import settings
-from django.core.cache import cache
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APIClient
