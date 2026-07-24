@@ -71,6 +71,16 @@
       transform: translateY(100%);
     }
   }
+
+  --animate-shimmer: shimmer 1.5s linear infinite;
+  @keyframes shimmer {
+    from {
+      background-position: 200% center;
+    }
+    to {
+      background-position: -200% center;
+    }
+  }
 }
 
 :root {
@@ -175,5 +185,11 @@
     clip: rect(0, 0, 0, 0);
     white-space: nowrap;
     border-width: 0;
+  }
+
+  img,
+  video {
+    max-width: 100%;
+    height: auto;
   }
 }

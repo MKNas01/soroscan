@@ -13,13 +13,25 @@ const config: Config = {
   moduleNameMapper: {
     '^@/(.*)$': '<rootDir>/$1',
   },
+  
+  // Coverage collection - combined exclusions
   collectCoverageFrom: [
     'src/**/*.{js,jsx,ts,tsx}', 
     'app/**/*.{js,jsx,ts,tsx}', 
-    'components/**/*.{js,jsx,ts,tsx}', 
+    'components/**/*.{js,jsx,ts,tsx}',
+    'lib/**/*.{ts,tsx}',
+    'context/**/*.{ts,tsx}',
+    'providers/**/*.{ts,tsx}',
     '!**/*.d.ts', 
-    '!**/node_modules/**'
+    '!**/node_modules/**',
+    '!**/__generated__/**',
+    '!**/gql/**',
   ],
+
+  coverageDirectory: 'coverage',
+  coverageReporters: ['text', 'text-summary', 'lcov', 'json', 'html'],
+
+  // Preserved the 70% threshold mandated by the issue
   coverageThreshold: {
     global: {
       branches: 70,

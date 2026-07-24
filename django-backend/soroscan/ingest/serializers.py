@@ -1,12 +1,90 @@
 """
 DRF Serializers for SoroScan API.
 """
+import re
+
 from rest_framework import serializers
 
 from django.utils.text import slugify
 
 from .cache_utils import get_event_count
-from .models import APIKey, ContractEvent, ContractInvocation, Team, TeamMembership, TrackedContract, WebhookSubscription
+from .models import (
+    APIKey,
+    ContractEvent,
+    ContractInvocation,
+    ContractSnapshot,
+    ContractSource,
+    ContractVerification,
+    Organization,
+    OrganizationBudget,
+    OrganizationCostSnapshot,
+    OrganizationMembership,
+    StateChange,
+    Team,
+    TeamMembership,
+    TrackedContract,
+    WebhookSubscription,
+)
+
+_CONTRACT_ID_RE = re.compile(r"^C[A-Z2-7]{55}$")
+_VALID_NETWORKS = {choice[0] for choice in TrackedContract.Network.choices}
+
+
+class OrganizationSerializer(serializers.ModelSerializer):
+    """Organization serializer with owner-managed tenancy settings."""
+
+    class Meta:
+        model = Organization
+        fields = ["id", "name", "slug", "settings", "quota", "cors_origins", "created_at", "updated_at"]
+        read_only_fields = ["id", "slug", "created_at", "updated_at"]
+
+    def create(self, validated_data):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or not user.is_authenticated:
+            raise serializers.ValidationError("Authentication required.")
+        org = Organization.objects.create(owner=user, **validated_data)
+        OrganizationMembership.objects.get_or_create(
+            organization=org,
+            user=user,
+            defaults={"role": OrganizationMembership.Role.OWNER, "invited_by": user},
+        )
+        return org
+
+
+class OrganizationCorsSerializer(serializers.ModelSerializer):
+    """
+    Serializer for updating an Organization's per-org CORS allowed origins.
+
+    Each entry must be a non-empty string beginning with ``http://`` or
+    ``https://``.  Trailing slashes are stripped for consistency.
+    """
+
+    cors_origins = serializers.ListField(
+        child=serializers.CharField(max_length=2048),
+        allow_empty=True,
+        help_text=(
+            'List of allowed CORS origins, e.g. ["https://app.example.com"]. '
+            "Each entry must start with http:// or https://."
+        ),
+    )
+
+    class Meta:
+        model = Organization
+        fields = ["id", "name", "cors_origins"]
+        read_only_fields = ["id", "name"]
+
+    def validate_cors_origins(self, value):
+        cleaned = []
+        for raw in value:
+            origin = raw.strip().rstrip("/")
+            if not (origin.startswith("http://") or origin.startswith("https://")):
+                raise serializers.ValidationError(
+                    f"Invalid origin '{raw}': must start with http:// or https://"
+                )
+            if origin:
+                cleaned.append(origin)
+        return cleaned
 
 
 class TeamSerializer(serializers.ModelSerializer):
@@ -40,6 +118,41 @@ class TeamSerializer(serializers.ModelSerializer):
         return team
 
 
+class OrganizationBudgetSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OrganizationBudget
+        fields = [
+            "monthly_budget_usd",
+            "warning_threshold_percent",
+            "critical_threshold_percent",
+            "is_active",
+            "updated_at",
+        ]
+
+
+class OrganizationCostSnapshotSerializer(serializers.ModelSerializer):
+    organization_id = serializers.IntegerField(source="organization.id", read_only=True)
+    organization_name = serializers.CharField(source="organization.name", read_only=True)
+
+    class Meta:
+        model = OrganizationCostSnapshot
+        fields = [
+            "organization_id",
+            "organization_name",
+            "month",
+            "rpc_calls",
+            "storage_bytes",
+            "compute_units",
+            "rpc_cost_usd",
+            "storage_cost_usd",
+            "compute_cost_usd",
+            "actual_cost_usd",
+            "projected_monthly_cost_usd",
+            "breakdown",
+            "updated_at",
+        ]
+
+
 class TeamMemberAddSerializer(serializers.Serializer):
     """Add an existing user to a team (by user id)."""
 
@@ -55,6 +168,11 @@ class TrackedContractSerializer(serializers.ModelSerializer):
     Serializer for TrackedContract model.
     Used for creating, updating, and returning tracked Soroban smart contracts.
     """
+
+    # Declare these as plain CharField to bypass model-level RegexValidator/UniqueValidator
+    # and choices validation so our validate_* methods control error messages entirely.
+    contract_id = serializers.CharField(validators=[])
+    network = serializers.CharField(required=False, default=TrackedContract.Network.MAINNET)
 
     event_count = serializers.SerializerMethodField()
     warnings = serializers.SerializerMethodField()
@@ -72,6 +190,7 @@ class TrackedContractSerializer(serializers.ModelSerializer):
             "name",
             "alias",
             "description",
+            "network",
             "abi_schema",
             "json_schema",
             "is_active",
@@ -80,15 +199,32 @@ class TrackedContractSerializer(serializers.ModelSerializer):
             "max_events_per_minute",
             "event_filter_type",
             "event_filter_list",
+            "metadata",
             "last_indexed_ledger",
             "team",
             "event_count",
             "last_event_at",
             "warnings",
+            "is_paused",
+            "paused_at",
+            "pause_reason",
+            "resume_at",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "last_indexed_ledger", "event_count", "last_event_at", "warnings", "created_at", "updated_at"]
+        read_only_fields = [
+            "id",
+            "last_indexed_ledger",
+            "event_count",
+            "last_event_at",
+            "warnings",
+            "is_paused",
+            "paused_at",
+            "pause_reason",
+            "resume_at",
+            "created_at",
+            "updated_at",
+        ]
 
     def get_event_count(self, obj) -> int:
         return get_event_count(obj.contract_id)
@@ -96,6 +232,34 @@ class TrackedContractSerializer(serializers.ModelSerializer):
     def get_warnings(self, obj) -> list[dict[str, str]]:
         warning = obj.deprecation_warning()
         return [warning] if warning else []
+
+    def validate_contract_id(self, value: str) -> str:
+        value = value.strip()
+
+        if not _CONTRACT_ID_RE.match(value):
+            raise serializers.ValidationError(
+                "Invalid contract address. A Soroban contract address must start "
+                "with 'C', be exactly 56 characters long, and use only uppercase "
+                "Base32 characters (A-Z and 2-7)."
+            )
+
+        # On create, reject duplicates with a clear message.
+        if self.instance is None:
+            if TrackedContract.objects.filter(contract_id=value).exists():
+                raise serializers.ValidationError(
+                    f"Contract '{value}' is already registered. "
+                    "Each contract address can only be tracked once."
+                )
+
+        return value
+
+    def validate_network(self, value: str) -> str:
+        if value not in _VALID_NETWORKS:
+            valid = ", ".join(sorted(_VALID_NETWORKS))
+            raise serializers.ValidationError(
+                f"'{value}' is not a valid network. Choose one of: {valid}."
+            )
+        return value
 
     def validate_team(self, value):
         request = self.context.get("request")
@@ -105,7 +269,6 @@ class TrackedContractSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError("You are not a member of this team.")
         return value
 
-
 class ContractEventSerializer(serializers.ModelSerializer):
     """
     Serializer for ContractEvent model.
@@ -114,6 +277,7 @@ class ContractEventSerializer(serializers.ModelSerializer):
 
     contract_id = serializers.CharField(source="contract.contract_id", read_only=True)
     contract_name = serializers.CharField(source="contract.name", read_only=True)
+    transaction_id = serializers.CharField(source="tx_hash", read_only=True)
 
     class Meta:
         model = ContractEvent
@@ -130,6 +294,7 @@ class ContractEventSerializer(serializers.ModelSerializer):
             "event_index",
             "timestamp",
             "tx_hash",
+            "transaction_id",
             "schema_version",
             "validation_status",
             "signature_status",
@@ -146,6 +311,7 @@ class ContractEventSerializer(serializers.ModelSerializer):
             "ledger",
             "timestamp",
             "tx_hash",
+            "transaction_id",
             "schema_version",
             "validation_status",
             "signature_status",
@@ -204,6 +370,10 @@ class WebhookSubscriptionSerializer(serializers.ModelSerializer):
             "target_url",
             "is_active",
             "signature_algorithm",
+            "ack_header_name",
+            "ack_header_value",
+            "delivery_sla_seconds",
+            "escalation_policy",
             "filter_condition",
             "created_at",
             "last_triggered",
@@ -220,36 +390,66 @@ class WebhookSubscriptionSerializer(serializers.ModelSerializer):
         if not isinstance(value, dict):
             raise serializers.ValidationError("filter_condition must be an object.")
 
-        allowed_ops = {"and", "or", "not", "eq", "neq", "gt", "gte", "lt", "lte", "in", "contains", "startswith", "regex"}
 
-        def _validate(node: dict):
-            if not isinstance(node, dict):
-                raise serializers.ValidationError("Each condition node must be an object.")
-            op = str(node.get("op", "")).lower()
-            if op not in allowed_ops:
-                raise serializers.ValidationError(f"Unsupported operator: {op}")
+    def validate(self, attrs):
+            contract = attrs.get("contract")
+            if not contract and self.instance:
+                contract = self.instance.contract
+                
+            target_url = attrs.get("target_url")
+            if not target_url and self.instance:
+                target_url = self.instance.target_url
 
-            if op in {"and", "or"}:
-                conditions = node.get("conditions")
-                if not isinstance(conditions, list) or not conditions:
-                    raise serializers.ValidationError(f"'{op}' requires a non-empty conditions array.")
-                for sub in conditions:
-                    _validate(sub)
-                return
+            # Check for duplicates (Issue #474)
+            if contract and target_url:
+                qs = WebhookSubscription.objects.filter(contract=contract, target_url=target_url)
+                if self.instance:
+                    qs = qs.exclude(pk=self.instance.pk)
+                if qs.exists():
+                    raise serializers.ValidationError({
+                        "target_url": "A webhook subscription for this URL and contract already exists."
+                    })
 
-            if op == "not":
-                condition = node.get("condition")
-                if not isinstance(condition, dict):
-                    raise serializers.ValidationError("'not' requires a condition object.")
-                _validate(condition)
-                return
+            if contract:
+                estimated_size = contract.metadata.get("estimated_payload_size", 0)
+                if estimated_size > 1048576:  # 1MB
+                    raise serializers.ValidationError({"contract": "Estimated payload exceeds 1MB limit."})
+                    
+                if contract.metadata.get("is_massive", False):
+                    raise serializers.ValidationError({"contract": "Contract events are known to be massive."})
+                    
+            return attrs
 
-            if "field" not in node:
-                raise serializers.ValidationError(f"'{op}' requires a field.")
-            if "value" not in node:
-                raise serializers.ValidationError(f"'{op}' requires a value.")
+    def validate_escalation_policy(self, value):
+        if value in (None, []):
+            return []
+        if not isinstance(value, list):
+            raise serializers.ValidationError("escalation_policy must be a list.")
 
-        _validate(value)
+        for idx, item in enumerate(value):
+            if not isinstance(item, dict):
+                raise serializers.ValidationError(
+                    f"escalation_policy[{idx}] must be an object."
+                )
+            channel = str(item.get("channel", "")).strip().lower()
+            if channel not in {"slack", "sms", "pagerduty"}:
+                raise serializers.ValidationError(
+                    f"escalation_policy[{idx}].channel must be slack, sms, or pagerduty."
+                )
+            if not str(item.get("target", "")).strip():
+                raise serializers.ValidationError(
+                    f"escalation_policy[{idx}].target is required."
+                )
+            try:
+                threshold = int(item.get("after_failures", 1))
+            except (TypeError, ValueError) as exc:
+                raise serializers.ValidationError(
+                    f"escalation_policy[{idx}].after_failures must be an integer."
+                ) from exc
+            if threshold < 1:
+                raise serializers.ValidationError(
+                    f"escalation_policy[{idx}].after_failures must be >= 1."
+                )
         return value
 
 
@@ -305,6 +505,7 @@ class EventSearchSerializer(serializers.ModelSerializer):
 
     contract_id = serializers.CharField(source="contract.contract_id", read_only=True)
     contract_name = serializers.CharField(source="contract.name", read_only=True)
+    transaction_id = serializers.CharField(source="tx_hash", read_only=True)
     relevance_score = serializers.SerializerMethodField()
 
     class Meta:
@@ -320,6 +521,7 @@ class EventSearchSerializer(serializers.ModelSerializer):
             "event_index",
             "timestamp",
             "tx_hash",
+            "transaction_id",
             "validation_status",
             "signature_status",
             "relevance_score",
@@ -329,3 +531,68 @@ class EventSearchSerializer(serializers.ModelSerializer):
     def get_relevance_score(self, obj) -> float:
         # Placeholder — set to 1.0 until full-text ranking is implemented.
         return 1.0
+
+
+class ContractSourceSerializer(serializers.ModelSerializer):
+    """
+    Serializer for ContractSource model.
+    """
+
+    class Meta:
+        model = ContractSource
+        fields = [
+            "id",
+            "contract",
+            "source_file",
+            "abi_json",
+            "uploaded_by",
+            "uploaded_at",
+        ]
+        read_only_fields = ["id", "uploaded_by", "uploaded_at"]
+
+
+class ContractVerificationSerializer(serializers.ModelSerializer):
+    """
+    Serializer for ContractVerification model.
+    """
+
+    class Meta:
+        model = ContractVerification
+        fields = [
+            "id",
+            "contract",
+            "source",
+            "status",
+            "bytecode_hash",
+            "compiler_version",
+            "verified_at",
+            "error_message",
+        ]
+        read_only_fields = ["id", "verified_at"]
+
+
+class StateChangeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StateChange
+        fields = [
+            "id",
+            "field_name",
+            "old_value",
+            "new_value",
+            "change_type",
+            "created_at",
+        ]
+
+
+class ContractSnapshotSerializer(serializers.ModelSerializer):
+    changes = StateChangeSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = ContractSnapshot
+        fields = [
+            "id",
+            "ledger_sequence",
+            "state_data",
+            "captured_at",
+            "changes",
+        ]

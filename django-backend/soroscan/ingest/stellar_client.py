@@ -10,6 +10,8 @@ from typing import Any, Optional
 from django.conf import settings
 from stellar_sdk import Keypair, TransactionBuilder
 from stellar_sdk.soroban_server import SorobanServer
+
+from soroscan.circuit_breaker import execute_with_circuit_breaker
 from stellar_sdk.xdr import (
     SCVal,
     SCValType,
@@ -300,7 +302,9 @@ class SorobanClient:
         pagination = {"limit": 200}
 
         try:
-            response = self.server.get_events(
+            response = execute_with_circuit_breaker(
+                "soroban_rpc",
+                self.server.get_events,
                 start_ledger=start_ledger,
                 end_ledger=end_ledger,
                 filters=filters,
@@ -308,7 +312,9 @@ class SorobanClient:
             )
         except TypeError:
             # Some SDK variants do not support end_ledger.
-            response = self.server.get_events(
+            response = execute_with_circuit_breaker(
+                "soroban_rpc",
+                self.server.get_events,
                 start_ledger=start_ledger,
                 filters=filters,
                 pagination=pagination,
@@ -439,7 +445,11 @@ class SorobanClient:
 
         try:
             # Fetch transaction from RPC
-            tx_response = self.server.get_transaction(tx_hash)
+            tx_response = execute_with_circuit_breaker(
+                "soroban_rpc",
+                self.server.get_transaction,
+                tx_hash,
+            )
 
             if not tx_response or getattr(tx_response, "status", None) == "NOT_FOUND":
                 return InvocationData(
@@ -474,3 +484,61 @@ class SorobanClient:
                 error=str(e),
             )
 
+    def get_contract_state(
+        self,
+        contract_id: str,
+        ledger: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """
+        Fetch contract persistent storage entries from Soroban RPC.
+
+        Returns a JSON-serializable dict keyed by entry identifiers. When the
+        RPC method is unavailable or fails, returns a minimal payload so callers
+        can still persist a snapshot marker.
+        """
+        payload: dict[str, Any] = {
+            "contract_id": contract_id,
+            "ledger": ledger,
+            "entries": {},
+        }
+
+        get_entries = getattr(self.server, "get_ledger_entries", None)
+        if get_entries is None:
+            logger.warning("SorobanServer.get_ledger_entries is unavailable")
+            return payload
+
+        try:
+            self._rate_limiter.acquire()
+            response = execute_with_circuit_breaker(
+                "soroban_rpc",
+                get_entries,
+                keys=[{"contractData": {"contract": contract_id, "key": "AAAA"}}],
+            )
+        except Exception:
+            logger.exception("Failed to fetch contract state for %s", contract_id)
+            return payload
+
+        entries = getattr(response, "entries", None) or getattr(response, "result", None) or []
+        serialized: dict[str, Any] = {}
+        for index, entry in enumerate(entries):
+            key = getattr(entry, "key", None) or getattr(entry, "contractData", None)
+            val = getattr(entry, "val", None) or getattr(entry, "value", None)
+            serialized[str(key or index)] = self._serialize_ledger_entry_value(val)
+
+        payload["entries"] = serialized
+        latest_ledger = getattr(response, "latestLedger", None)
+        if latest_ledger is not None:
+            payload["ledger"] = latest_ledger
+        return payload
+
+    @staticmethod
+    def _serialize_ledger_entry_value(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (str, int, float, bool, list, dict)):
+            return value
+        if hasattr(value, "to_dict"):
+            return value.to_dict()
+        if hasattr(value, "xdr"):
+            return {"xdr": value.xdr}
+        return str(value)

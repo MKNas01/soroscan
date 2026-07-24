@@ -3,6 +3,7 @@ Bug condition exploration test for the ingest app migration graph conflict.
 
 This test file ensures that the migration graph is consistent and has a single leaf node.
 The conflict between 0027_merge_final_leaf_nodes and 0029_contractmetadata has been resolved.
+The current leaf node is 0047_trackedcontract_is_paused_and_more.
 
 Validates: Requirements 2.1, 2.2
 """
@@ -20,9 +21,6 @@ def enable_db_access_for_all_tests():
 def test_single_leaf_node():
     """
     Assert the ingest migration graph has exactly one leaf node.
-
-    The current leaf is '0031_trackedcontract_json_schema_and_webhook_filters'
-    which depends on '0030_webhook_backoff_strategy'.
     """
     loader = MigrationLoader(None, ignore_no_migrations=True)
 
@@ -32,9 +30,9 @@ def test_single_leaf_node():
     assert len(leaf_nodes) == 1, (
         f"Expected 1 leaf node for 'ingest', found {len(leaf_nodes)}: {leaf_nodes}"
     )
-    assert leaf_nodes[0][1] == "0031_trackedcontract_json_schema_and_webhook_filters", (
-        "Expected leaf node '0031_trackedcontract_json_schema_and_webhook_filters', "
-        f"got '{leaf_nodes[0][1]}'"
+    # Updated to reflect the newest migration leaf.
+    assert leaf_nodes[0][1].startswith("0047_"), (
+        f"Expected leaf node starting with '0047_', got '{leaf_nodes[0][1]}'"
     )
 
 

@@ -15,18 +15,36 @@ from django.utils import timezone
 from strawberry import auto
 from strawberry.types import Info
 
-from .cache_utils import get_or_set_json, query_cache_ttl, stable_cache_key
+from .cache_utils import (
+    get_or_set_json,
+    invalidate_contract_query_cache,
+    invalidate_cached_contract,
+    invalidate_event_count_cache,
+    query_cache_ttl,
+    stable_cache_key,
+)
 from .models import (
     CallGraph,
     ContractDependency,
     ContractEvent,
     ContractInvocation,
     ContractMetadata,
+    ContractVerification,
     Notification,
     TrackedContract,
     WebhookDeliveryLog,
 )
+from .services.contract_state import decode_state_payload, get_state_at_ledger
 from .services.timeline import build_timeline
+from ..graphql_extensions import (
+    GraphQLRateLimitExtension,
+    GraphQLResolverLoggingExtension,
+    log_graphql_resolver,
+    IsAuthenticated,
+    IsStaff,
+    permission_classes,
+)
+from ..graphql_n1_detector import N1QueryDetectorExtension
 
 
 def _get_authenticated_user(info: Info):
@@ -63,12 +81,25 @@ class ContractType:
     deprecation_reason: auto
     event_filter_type: auto
     event_filter_list: strawberry.scalars.JSON
+    metadata: strawberry.scalars.JSON
     created_at: auto
+
+    @strawberry.field
+    def verification_status(self) -> Optional[str]:
+        try:
+            return self.verification.status
+        except ContractVerification.DoesNotExist:
+            return None
 
     @strawberry.field
     def team_id(self) -> Optional[int]:
         tid = getattr(self, "team_id", None)
         return int(tid) if tid is not None else None
+
+    @strawberry.field
+    def organization_id(self) -> Optional[int]:
+        oid = getattr(self, "organization_id", None)
+        return int(oid) if oid is not None else None
 
     @strawberry.field
     def event_count(self) -> int:
@@ -118,6 +149,24 @@ class ContractMetadataType:
     team_email: str
 
 
+@strawberry.type
+class StateChangeType:
+    field_name: str
+    old_value: Optional[strawberry.scalars.JSON]
+    new_value: Optional[strawberry.scalars.JSON]
+    change_type: str
+    created_at: datetime
+
+
+@strawberry.type
+class ContractStateType:
+    contract_id: str
+    ledger: int
+    state_data: strawberry.scalars.JSON
+    captured_at: Optional[datetime]
+    changes: List[StateChangeType]
+
+
 @strawberry_django.type(ContractEvent)
 class EventType:
     id: auto
@@ -141,6 +190,10 @@ class EventType:
     @strawberry.field
     def contract_name(self) -> str:
         return self.contract.name
+
+    @strawberry.field
+    def transaction_id(self) -> str:
+        return self.tx_hash
 
 
 @strawberry_django.type(ContractInvocation)
@@ -368,9 +421,16 @@ class NotificationType:
 @strawberry.type
 class Query:
     @strawberry.field
-    def contracts(self, is_active: Optional[bool] = None, alias: Optional[str] = None) -> list[ContractType]:
+    def contracts(self, info: Info, is_active: Optional[bool] = None, alias: Optional[str] = None) -> list[ContractType]:
         """Get all tracked contracts. Optionally filter by alias substring. Sorted by alias when set."""
         qs = TrackedContract.objects.select_related("contractmetadata").all()
+        user = _get_authenticated_user(info)
+        if user:
+            qs = qs.filter(
+                Q(owner=user)
+                | Q(team__memberships__user=user)
+                | Q(organization__memberships__user=user)
+            ).distinct()
         if is_active is not None:
             qs = qs.filter(is_active=is_active)
         if alias is not None:
@@ -386,12 +446,25 @@ class Query:
         return qs
 
     @strawberry.field
-    def contract(self, contract_id: str) -> Optional[ContractType]:
+    def contract(self, info: Info, contract_id: str) -> Optional[ContractType]:
         """Get a specific contract by ID."""
+        user = _get_authenticated_user(info)
+        if not user:
+            try:
+                return TrackedContract.objects.select_related("contractmetadata").get(contract_id=contract_id)
+            except TrackedContract.DoesNotExist:
+                return None
         try:
-            return TrackedContract.objects.select_related("contractmetadata").get(contract_id=contract_id)
+            return TrackedContract.objects.select_related("contractmetadata").get(
+                contract_id=contract_id,
+                owner=user,
+            )
         except TrackedContract.DoesNotExist:
-            return None
+            return TrackedContract.objects.select_related("contractmetadata").filter(
+                contract_id=contract_id,
+            ).filter(
+                Q(team__memberships__user=user) | Q(organization__memberships__user=user)
+            ).first()
 
     @strawberry.field
     def contract_metadata(self, contract_id: str) -> Optional[ContractMetadataType]:
@@ -523,6 +596,15 @@ class Query:
             return None
 
     @strawberry.field
+    def transaction(self, id: str) -> list[EventType]:
+        """Return cross-contract events grouped by atomic transaction id."""
+        return list(
+            ContractEvent.objects.select_related("contract")
+            .filter(tx_hash=id)
+            .order_by("ledger", "event_index", "id")
+        )
+
+    @strawberry.field
     def search_events(self, query: EventSearchQuery) -> list[EventSearchResult]:
         """
         Full-text and field-level search on contract event payloads.
@@ -627,6 +709,37 @@ class Query:
         return get_or_set_json(key, query_cache_ttl(), _stats)
 
     @strawberry.field
+    def contract_state(self, contract_id: str, ledger: int) -> Optional[ContractStateType]:
+        """Return contract state at or before the requested ledger."""
+        try:
+            contract = TrackedContract.objects.get(contract_id=contract_id)
+        except TrackedContract.DoesNotExist:
+            return None
+
+        snapshot = get_state_at_ledger(contract, ledger)
+        if snapshot is None:
+            return None
+
+        changes = [
+            StateChangeType(
+                field_name=change.field_name,
+                old_value=change.old_value,
+                new_value=change.new_value,
+                change_type=change.change_type,
+                created_at=change.created_at,
+            )
+            for change in snapshot.changes.all()
+        ]
+
+        return ContractStateType(
+            contract_id=contract.contract_id,
+            ledger=snapshot.ledger_sequence,
+            state_data=decode_state_payload(snapshot.state_data),
+            captured_at=snapshot.captured_at,
+            changes=changes,
+        )
+
+    @strawberry.field
     def dependencies_for_contract(self, contract_id: str) -> Optional[CallGraphType]:
         """
         Return the dependency DAG for a specific contract.
@@ -698,6 +811,7 @@ class Query:
         )
 
     @strawberry.field
+    @permission_classes([IsStaff])
     def system_metrics(self, info: Info) -> SystemMetrics:
         """Get system-wide health and performance metrics."""
         user = _get_authenticated_user(info)
@@ -736,6 +850,7 @@ class Query:
         )
 
     @strawberry.field
+    @permission_classes([IsAuthenticated])
     def notifications(
         self,
         info: Info,
@@ -766,6 +881,7 @@ class Query:
         return Notification.objects.filter(user=user, is_read=False).count()
 
     @strawberry.field
+    @permission_classes([IsStaff])
     def recent_errors(self, info: Info, limit: int = 10) -> list[ErrorLog]:
         """Get recent system errors and warnings."""
         user = _get_authenticated_user(info)
@@ -790,6 +906,7 @@ class Query:
 @strawberry.type
 class Mutation:
     @strawberry.mutation
+    @permission_classes([IsAuthenticated])
     def register_contract(
         self,
         info: Info,
@@ -797,6 +914,7 @@ class Mutation:
         name: str,
         description: str = "",
         team_id: Optional[int] = None,
+        metadata: Optional[strawberry.scalars.JSON] = None,
     ) -> ContractType:
         """Register a new contract for indexing."""
         user = _get_authenticated_user(info)
@@ -820,10 +938,13 @@ class Mutation:
             description=description,
             owner=user,
             team=team,
+            metadata=metadata or {},
         )
+        invalidate_cached_contract(contract_id)
         return contract
 
     @strawberry.mutation
+    @permission_classes([IsAuthenticated])
     def mark_notification_read(self, info: Info, notification_id: int) -> bool:
         """Mark a single notification as read."""
         user = _get_authenticated_user(info)
@@ -833,6 +954,7 @@ class Mutation:
         return updated > 0
 
     @strawberry.mutation
+    @permission_classes([IsAuthenticated])
     def mark_all_notifications_read(self, info: Info) -> int:
         """Mark all notifications as read. Returns count updated."""
         user = _get_authenticated_user(info)
@@ -841,6 +963,7 @@ class Mutation:
         return Notification.objects.filter(user=user, is_read=False).update(is_read=True)
 
     @strawberry.mutation
+    @permission_classes([IsAuthenticated])
     def clear_all_notifications(self, info: Info) -> int:
         """Delete all notifications for the user. Returns count deleted."""
         user = _get_authenticated_user(info)
@@ -850,6 +973,7 @@ class Mutation:
         return count
 
     @strawberry.mutation
+    @permission_classes([IsAuthenticated])
     def set_contract_metadata(
         self,
         info: Info,
@@ -885,6 +1009,8 @@ class Mutation:
             },
         )
 
+        invalidate_cached_contract(contract_id)
+
         try:
             instance.full_clean()
         except ValidationError as exc:
@@ -901,6 +1027,7 @@ class Mutation:
         )
 
     @strawberry.mutation
+    @permission_classes([IsAuthenticated])
     def delete_contract_metadata(self, info: Info, contract_id: str) -> bool:
         """Delete metadata for a contract. Returns False if no record exists."""
         user = _get_authenticated_user(info)
@@ -909,11 +1036,13 @@ class Mutation:
 
         try:
             ContractMetadata.objects.get(contract__contract_id=contract_id).delete()
+            invalidate_cached_contract(contract_id)
             return True
         except ContractMetadata.DoesNotExist:
             return False
 
     @strawberry.mutation
+    @permission_classes([IsAuthenticated])
     def update_contract(
         self,
         info: Info,
@@ -924,6 +1053,7 @@ class Mutation:
         alias: Optional[str] = None,
         event_filter_type: Optional[str] = None,
         event_filter_list: Optional[list[str]] = None,
+        metadata: Optional[strawberry.scalars.JSON] = None,
     ) -> Optional[ContractType]:
         """Update a tracked contract."""
         user = _get_authenticated_user(info)
@@ -950,8 +1080,14 @@ class Mutation:
             contract.event_filter_type = event_filter_type
         if event_filter_list is not None:
             contract.event_filter_list = event_filter_list
+        if metadata is not None:
+            contract.metadata = metadata
 
         contract.save()
+
+        invalidate_cached_contract(contract_id)
+        invalidate_contract_query_cache(contract_id)
+        invalidate_event_count_cache(contract_id)
 
         # Push notification when a contract is paused
         if is_active is False:
@@ -973,6 +1109,7 @@ class Mutation:
 @strawberry.type
 class Subscription:
     @strawberry.subscription
+    @log_graphql_resolver
     async def notifications(
         self, info: Info
     ) -> AsyncGenerator[NotificationType, None]:
@@ -1030,6 +1167,7 @@ class Subscription:
             await channel_layer.group_discard(group_name, channel_name)
 
     @strawberry.subscription
+    @log_graphql_resolver
     async def contract_events(
         self, info: Info, contract_id: str
     ) -> AsyncGenerator[EventType, None]:
@@ -1083,4 +1221,13 @@ class Subscription:
             await channel_layer.group_discard(group_name, channel_name)
 
 
-schema = strawberry.Schema(query=Query, mutation=Mutation, subscription=Subscription)
+schema = strawberry.Schema(
+    query=Query,
+    mutation=Mutation,
+    subscription=Subscription,
+    extensions=[
+        GraphQLRateLimitExtension,
+        GraphQLResolverLoggingExtension,
+        N1QueryDetectorExtension,
+    ],
+)

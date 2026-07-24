@@ -310,9 +310,9 @@ class APIKeyThrottleTests(TestCase):
         view.kwargs = {}
         throttle.allow_request(request, view)
         headers = getattr(request, "_api_key_throttle_headers", {})
-        self.assertIn("X-RateLimit-Limit", headers)
-        self.assertIn("X-RateLimit-Remaining", headers)
-        self.assertIn("X-RateLimit-Reset", headers)
+        self.assertIn("RateLimit-Limit", headers)
+        self.assertIn("RateLimit-Remaining", headers)
+        self.assertIn("RateLimit-Reset", headers)
 
     def test_key_from_query_param(self):
         from soroscan.throttles import APIKeyThrottle
@@ -363,12 +363,41 @@ class SlowQueryMiddlewareTests(TestCase):
         mw = SlowQueryMiddleware(get_response)
         request = RequestFactory().get("/")
         request._api_key_throttle_headers = {
-            "X-RateLimit-Limit": "50",
-            "X-RateLimit-Remaining": "49",
-            "X-RateLimit-Reset": "3600",
+            "RateLimit-Limit": "50",
+            "RateLimit-Remaining": "49",
+            "RateLimit-Reset": "3600",
         }
         response = mw(request)
-        self.assertEqual(response.get("X-RateLimit-Limit"), "50")
+        self.assertEqual(response.get("RateLimit-Limit"), "50")
+
+    @patch("soroscan.middleware.slow_query_logger")
+    def test_logs_slow_query_with_params(self, mock_logger):
+        from soroscan.middleware import SlowQueryMiddleware
+        from django.db import connection
+
+        # Override the threshold to ensure the query is always considered "slow"
+        mw = SlowQueryMiddleware(lambda r: MagicMock())
+        mw.threshold_ms = 0
+        
+        request = RequestFactory().get("/")
+        
+        # We need to simulate a DB query through the middleware.
+        # Since the middleware sets up a connection.execute_wrapper during the request,
+        # we can just call it with a fake execute function.
+        def get_response(req):
+            # Inside the wrapper, doing an actual query
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM sqlite_master WHERE name = %s", ["test"])
+            return {}
+            
+        mw = SlowQueryMiddleware(get_response)
+        mw.threshold_ms = -1 # Always trigger slow query log
+        mw(request)
+        
+        mock_logger.warning.assert_called()
+        # Verify that the params are in the extra dict or the log message
+        args, kwargs = mock_logger.warning.call_args
+        self.assertIn("['test']", kwargs.get("extra", {}).get("params", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +514,7 @@ class EventSearchTests(TestCase):
 
 class SendAlertTests(TestCase):
     def setUp(self):
+        cache.clear()
         self.user = User.objects.create_user(username="alertuser", password="pass")
         self.contract = TrackedContract.objects.create(
             contract_id="B" * 56,
@@ -569,6 +599,9 @@ class SendAlertTests(TestCase):
 
         result = send_alert(self.rule.id, 9999)
         self.assertEqual(result, "skipped:event_gone")
+
+    def tearDown(self):
+        cache.clear()
 
 
 class EvaluateAlertRulesTests(TestCase):

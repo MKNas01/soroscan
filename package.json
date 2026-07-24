@@ -6,6 +6,7 @@
     "sdk/typescript"
   ],
   "dependencies": {
-    "recharts": "^3.8.1"
+    "recharts": "^3.8.1",
+    "redocusaurus": "^2.5.0"
   }
 }

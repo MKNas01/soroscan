@@ -5,6 +5,7 @@ Registers application-level metrics using prometheus_client.
 Guards against duplicate registration so tests can import this module
 multiple times without raising ``ValueError: Duplicated timeseries``.
 """
+
 from prometheus_client import REGISTRY, Counter, Gauge, Histogram
 
 __all__ = [
@@ -21,7 +22,13 @@ __all__ = [
     "backfill_batch_duration_seconds",
     "webhook_deliveries_total",
     "webhook_delivery_duration_seconds",
+    "webhook_ack_total",
+    "webhook_sla_total",
+    "webhook_escalations_total",
+    "webhook_deduplicated_total",
+    "webhook_dead_letter_depth",
     "alert_rules_evaluated_total",
+    "alert_deduplicated_total",
     "remediation_rules_evaluated_total",
     "archive_events_total",
     "ledgers_scanned_total",
@@ -32,10 +39,20 @@ __all__ = [
     "cache_hits_total",
     "cache_misses_total",
     "event_streaming_total",
+    "ledger_gaps_total",
+    "missing_events_total",
+    "event_ingestion_rate_gauge",
+    "event_payload_compression_ratio",
+    "circuit_breaker_state_gauge",
+    "circuit_breaker_trips_total",
+    "circuit_breaker_calls_total",
+    "celery_tasks_total",
+    "celery_tasks_active",
+    "celery_task_duration_seconds",
 ]
 
 
-def _get_or_create(metric_cls, name, documentation, labelnames=()):
+def _get_or_create(metric_cls, name, documentation, labelnames=(), **metric_kwargs):
     """
     Return an existing collector from REGISTRY if one with *name* is already
     registered, otherwise create and register a new one.
@@ -59,8 +76,8 @@ def _get_or_create(metric_cls, name, documentation, labelnames=()):
 
     # Not found — safe to create (which auto-registers).
     if labelnames:
-        return metric_cls(name, documentation, labelnames)
-    return metric_cls(name, documentation)
+        return metric_cls(name, documentation, labelnames, **metric_kwargs)
+    return metric_cls(name, documentation, **metric_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -146,11 +163,45 @@ webhook_delivery_duration_seconds = _get_or_create(
     "End-to-end latency of a single webhook delivery attempt in seconds",
 )
 
+webhook_ack_total = _get_or_create(
+    Counter,
+    "soroscan_webhook_ack_total",
+    "Webhook acknowledgement outcomes by validation result",
+    ["status"],
+)
+
+webhook_sla_total = _get_or_create(
+    Counter,
+    "soroscan_webhook_sla_total",
+    "Webhook delivery SLA outcomes for acknowledged deliveries",
+    ["outcome"],
+)
+
+webhook_escalations_total = _get_or_create(
+    Counter,
+    "soroscan_webhook_escalations_total",
+    "Number of escalation notifications sent for webhook failures",
+    ["channel", "status"],
+)
+
+webhook_deduplicated_total = _get_or_create(
+    Counter,
+    "soroscan_webhook_deduplicated_total",
+    "Number of webhook deliveries skipped due to deduplication",
+)
+
 alert_rules_evaluated_total = _get_or_create(
     Counter,
     "soroscan_alert_rules_evaluated_total",
     "Number of alert-rule evaluations, labelled by outcome",
     ["outcome"],
+)
+
+alert_deduplicated_total = _get_or_create(
+    Counter,
+    "soroscan_alert_deduplicated_total",
+    "Number of alert sends skipped due to deduplication",
+    ["scope"],
 )
 
 remediation_rules_evaluated_total = _get_or_create(
@@ -173,7 +224,6 @@ ledgers_scanned_total = _get_or_create(
     "Total ledger sequences visited during sync polling",
     ["network"],
 )
-
 
 
 events_rate_limited_total = _get_or_create(
@@ -204,6 +254,12 @@ webhook_payload_bytes = _get_or_create(
     ["contract_id"],
 )
 
+webhook_dead_letter_depth = _get_or_create(
+    Gauge,
+    "soroscan_webhook_dead_letter_depth",
+    "Current number of unresolved webhook dead-letter entries",
+)
+
 cache_hits_total = _get_or_create(
     Counter,
     "soroscan_cache_hits_total",
@@ -223,4 +279,70 @@ event_streaming_total = _get_or_create(
     "soroscan_event_streaming_total",
     "Total number of event streaming attempts by status and backend",
     ["status", "backend"],
+)
+
+ledger_gaps_total = _get_or_create(
+    Counter,
+    "soroscan_ledger_gaps_total",
+    "Total number of detected ledger-gap ranges",
+    ["contract_id"],
+)
+
+missing_events_total = _get_or_create(
+    Counter,
+    "soroscan_missing_events_total",
+    "Total number of missing ledgers/events detected by reconciliation",
+    ["contract_id"],
+)
+
+event_ingestion_rate_gauge = _get_or_create(
+    Gauge,
+    "soroscan_event_ingestion_rate",
+    "Current event ingestion rate in events per second",
+)
+
+event_payload_compression_ratio = _get_or_create(
+    Histogram,
+    "soroscan_event_payload_compression_ratio",
+    "Observed compressed-to-raw size ratio for stored event payloads",
+    buckets=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.25, 1.5),
+)
+circuit_breaker_state_gauge = _get_or_create(
+    Gauge,
+    "soroscan_circuit_breaker_state",
+    "Circuit breaker state (0=closed, 1=half_open, 2=open)",
+    ["name"],
+)
+
+circuit_breaker_trips_total = _get_or_create(
+    Counter,
+    "soroscan_circuit_breaker_trips_total",
+    "Number of times a circuit breaker opened",
+    ["name"],
+)
+
+circuit_breaker_calls_total = _get_or_create(
+    Counter,
+    "soroscan_circuit_breaker_calls_total",
+    "Circuit breaker protected call outcomes",
+    ["name", "outcome"],
+)
+
+celery_tasks_total = _get_or_create(
+    Counter,
+    "soroscan_celery_tasks_total",
+    "Celery task terminal outcomes",
+    ["task_name", "status", "error_type"],
+)
+celery_tasks_active = _get_or_create(
+    Gauge,
+    "soroscan_celery_tasks_active",
+    "Celery tasks currently executing",
+    ["task_name"],
+)
+celery_task_duration_seconds = _get_or_create(
+    Histogram,
+    "soroscan_celery_task_duration_seconds",
+    "Celery task execution duration",
+    ["task_name"],
 )

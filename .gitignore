@@ -1,6 +1,10 @@
 .agent/
 .agents/
-ISSUES.md
-FRONTEND_ISSUES.md
 update-main.sh
-node_modules
+venv/
+.venv/
+.venv-*/
+node_modules/
+PUSH_ISSUES_README.md
+push_issues_to_github.py
+backlogs/

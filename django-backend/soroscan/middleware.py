@@ -1,15 +1,18 @@
 """
 Middleware for request-scoped log context (request_id) and slow query logging.
 """
+import json
 import logging
 import time
 import uuid
 
 from django.conf import settings
 from django.db import connection
+from django.http import JsonResponse
 
 from .log_context import set_request_id
 
+logger = logging.getLogger(__name__)
 slow_query_logger = logging.getLogger("soroscan.slow_queries")
 
 
@@ -20,10 +23,39 @@ class RequestIdMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        request_id = getattr(request, "request_id", None) or uuid.uuid4().hex
+        request_id = request.META.get("HTTP_X_REQUEST_ID") or getattr(request, "request_id", None) or uuid.uuid4().hex
         request.request_id = request_id
         set_request_id(request_id)
-        return self.get_response(request)
+        
+        response = self.get_response(request)
+        response["X-Request-ID"] = request_id
+        
+        if response.status_code >= 400 and response.get("Content-Type", "").startswith("application/json"):
+            if not getattr(response, "streaming", False):
+                try:
+                    data = json.loads(response.content)
+                    if isinstance(data, dict):
+                        data["request_id"] = request_id
+                        new_content = json.dumps(data).encode("utf-8")
+                        response.content = new_content
+                        if "Content-Length" in response:
+                            response["Content-Length"] = str(len(new_content))
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                    
+        return response
+
+
+class PlatformVersionMiddleware:
+    """Attach platform version metadata to every response."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        response["X-SoroScan-Version"] = getattr(settings, "SOFTWARE_VERSION", "unknown")
+        return response
 
 
 class ReverseProxyFixedIPMiddleware:
@@ -70,13 +102,17 @@ class SlowQueryMiddleware:
             finally:
                 duration_ms = (time.monotonic() - start) * 1000
                 if duration_ms >= threshold:
+                    # Convert params to a serializable format or stringify it to avoid log formatting errors
+                    safe_params = str(params)[:1000] if params else ""
                     slow_query_logger.warning(
-                        "Slow query (%dms): %s",
+                        "Slow query (%dms): %s\nParams: %s",
                         int(duration_ms),
                         (sql or "")[:1000],
+                        safe_params,
                         extra={
                             "duration_ms": round(duration_ms, 2),
                             "sql": (sql or "")[:1000],
+                            "params": safe_params,
                             "request_path": request.path,
                         },
                     )
@@ -84,10 +120,156 @@ class SlowQueryMiddleware:
         with connection.execute_wrapper(_execute):
             response = self.get_response(request)
 
-        # Forward X-RateLimit-* headers set by APIKeyThrottle
+        # Forward RateLimit-* headers set by APIKeyThrottle
         headers = getattr(request, "_api_key_throttle_headers", None)
         if headers and hasattr(response, "__setitem__"):
             for name, value in headers.items():
                 response[name] = value
+
+        return response
+
+class RequestBodySizeMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        # We check this at the very beginning of the __call__
+        if request.method == "POST":
+            max_size = getattr(settings, "MAX_REQUEST_BODY_SIZE", 10485760)
+            try:
+                content_length = int(request.META.get('CONTENT_LENGTH', 0))
+                if content_length > max_size:
+                    logger.warning("Payload Too Large: %s bytes", content_length)
+                    return JsonResponse(
+                        {"error": "Payload Too Large", "limit": max_size},
+                        status=413
+                    )
+            except (ValueError, TypeError):
+                pass
+        
+        return self.get_response(request)
+        
+class GracefulShutdownMiddleware:
+    """Reject new requests during shutdown and track in-flight request count."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        from soroscan.shutdown import end_request, try_begin_request
+
+        if not try_begin_request():
+            return JsonResponse(
+                {"error": "Server is shutting down"},
+                status=503,
+            )
+        try:
+            return self.get_response(request)
+        finally:
+            end_request()
+
+
+class MaintenanceModeMiddleware:
+    """Return 503 for all non-admin routes when MAINTENANCE_MODE=True."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if getattr(settings, "MAINTENANCE_MODE", False) and not request.path.startswith("/admin"):
+            return JsonResponse(
+                {"error": "Service temporarily unavailable. Please try again later."},
+                status=503,
+            )
+        return self.get_response(request)
+
+
+class ApiDeprecationMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        deprecated_endpoints = getattr(settings, "DEPRECATED_ENDPOINTS", {})
+
+        # Normalize request path: remove leading/trailing slashes
+        norm_request_path = request.path.strip("/")
+
+        for path, config in deprecated_endpoints.items():
+            # Normalize config path
+            if path.strip("/") == norm_request_path:
+                response["Deprecation"] = "true"
+                response["Sunset"] = config.get("sunset", "")
+                response["Link"] = f'<{config.get("replacement", "")}>; rel="alternate"'
+                break
+        return response
+
+
+_STATIC_PATH_PREFIXES = ("/static/", "/media/", "/favicon.ico")
+
+ip_logger = logging.getLogger("soroscan.ip_access")
+
+
+class ClientIPLoggingMiddleware:
+    """
+    Log the client IP address, HTTP method, and request path for every
+    incoming API request.
+
+    The client IP is read from REMOTE_ADDR, which is expected to already
+    be set correctly by ReverseProxyFixedIPMiddleware when running behind
+    a proxy. Static-asset paths are excluded to avoid log noise.
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        path = request.path
+        if not path.startswith(_STATIC_PATH_PREFIXES):
+            client_ip = request.META.get("REMOTE_ADDR", "unknown")
+            ip_logger.info(
+                "%s %s from %s",
+                request.method,
+                path,
+                client_ip,
+                extra={
+                    "client_ip": client_ip,
+                    "method": request.method,
+                    "path": path,
+                },
+            )
+        return self.get_response(request)
+
+
+class CacheBustingMiddleware:
+    """
+    Add Cache-Control headers to API responses.
+
+    Supports cache busting via:
+    - ``Cache-Control: no-cache`` header from client
+    - ``X-Cache-Bust`` header from client
+    - ``Last-Modified`` / ``ETag`` conditional request support
+    """
+
+    CACHE_CONTROL_PATHS = ("/api/", "/graphql/")
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        # Check if client requests cache bypass
+        cache_bust = (
+            request.headers.get("Cache-Control") == "no-cache"
+            or request.headers.get("X-Cache-Bust") == "1"
+        )
+
+        response = self.get_response(request)
+
+        if any(request.path.startswith(p) for p in self.CACHE_CONTROL_PATHS):
+            if cache_bust:
+                response["Cache-Control"] = "no-cache, no-store, must-revalidate"
+                response["Pragma"] = "no-cache"
+            else:
+                response["Cache-Control"] = "private, max-age=0"
 
         return response

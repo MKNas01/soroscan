@@ -1,6 +1,7 @@
 """
 Test settings for SoroScan project.
 """
+from datetime import timedelta
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -10,10 +11,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = "django-insecure-test-key-for-testing-only"
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = False
 
 ALLOWED_HOSTS = ["*"]
 FRONTEND_BASE_URL = "http://localhost:3000"
+SOFTWARE_VERSION = "1.0.0-test"
 
 # Application definition
 INSTALLED_APPS = [
@@ -34,20 +36,27 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
-    "django_prometheus.middleware.PrometheusBeforeMiddleware",  # must be first
+    "django_prometheus.middleware.PrometheusBeforeMiddleware",
+    "soroscan.middleware.GracefulShutdownMiddleware",
+    "soroscan.middleware.RequestBodySizeMiddleware",
+    "soroscan.middleware.MaintenanceModeMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "corsheaders.middleware.CorsMiddleware",
+    "soroscan.cors_middleware.OrgCorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "soroscan.middleware.RequestIdMiddleware",
+    "soroscan.middleware.PlatformVersionMiddleware",
     "django.middleware.common.CommonMiddleware",
+    "django.middleware.gzip.GZipMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    "django_prometheus.middleware.PrometheusAfterMiddleware",   # must be last
+    "soroscan.middleware.ApiDeprecationMiddleware",
+    "django_prometheus.middleware.PrometheusAfterMiddleware",
 ]
 
-ROOT_URLCONF = "soroscan.urls"  # use main urls.py which has the /metrics route
+ROOT_URLCONF = "soroscan.urls_test"  # safe mirror — excludes strawberry/GDAL import
 
 TEMPLATES = [
     {
@@ -107,9 +116,14 @@ CACHES = {
     }
 }
 QUERY_CACHE_TTL_SECONDS = 60
+PACT_PROVIDER_STATES_ENABLED = True
 
 # REST Framework
 REST_FRAMEWORK = {
+    "EXCEPTION_HANDLER": "soroscan.exceptions.custom_exception_handler",
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ],
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 50,
     "DEFAULT_FILTER_BACKENDS": [
@@ -118,7 +132,7 @@ REST_FRAMEWORK = {
         "rest_framework.filters.OrderingFilter",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
-        "rest_framework.permissions.IsAuthenticated",
+        "rest_framework.permissions.IsAuthenticatedOrReadOnly",
     ],
     "DEFAULT_THROTTLE_RATES": {
         "anon": "1000/hour",
@@ -128,8 +142,19 @@ REST_FRAMEWORK = {
     },
 }
 
+
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    "ALGORITHM": "HS256",
+    "SIGNING_KEY": SECRET_KEY,
+    "AUTH_HEADER_TYPES": ("Bearer",),
+}
+
 # CORS
 CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOWED_ORIGINS = []
 
 # Celery - Test settings (synchronous execution)
 CELERY_TASK_ALWAYS_EAGER = True
@@ -139,6 +164,8 @@ CELERY_RESULT_BACKEND = "cache+memory://"
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
+SHUTDOWN_TIMEOUT_SECONDS = 30
+CELERY_WORKER_SOFT_SHUTDOWN_TIMEOUT = 30
 CELERY_TIMEZONE = TIME_ZONE
 
 # Stellar / Soroban Configuration
@@ -153,13 +180,27 @@ EVENT_STREAMING = {
     "backend": "kafka",
     "kafka": {
         "bootstrap_servers": ["localhost:9092"],
-        "topic_template": "soroscan-events-{contract_id}",
+        "topic": "soroscan.events",
+        "schema_registry_url": "",
     },
     "pubsub": {
         "project_id": "test-project",
-        "topic_template": "soroscan-events-{contract_id}",
+        "topic": "soroscan.events",
+    },
+    "sqs": {
+        "queue_url": "",
     },
 }
+
+# GraphQL Introspection — enabled in tests/dev
+GRAPHQL_INTROSPECTION_ENABLED = True
+GRAPHQL_MAX_COMPLEXITY = 1000
+GRAPHQL_N1_DETECTION_ENABLED = False
+
+# Fixed test seed for deterministic webhook signature tests.
+WEBHOOK_ED25519_SIGNING_SEED = (
+    "0000000000000000000000000000000000000000000000000000000000000001"
+)
 
 # Logging
 LOGGING = {
@@ -174,4 +215,14 @@ LOGGING = {
         "handlers": ["console"],
         "level": "WARNING",
     },
+    "loggers": {
+        "soroscan.migrate": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": True,
+        },
+    },
 }
+
+MAX_REQUEST_BODY_SIZE = 10485760
+DEPRECATED_ENDPOINTS = {}
