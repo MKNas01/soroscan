@@ -204,10 +204,19 @@ SIMPLE_JWT = {
     "AUTH_HEADER_TYPES": ("Bearer",),
 }
 
-# CORS
-CORS_ALLOW_ALL_ORIGINS = DEBUG
-CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=[])
-CORS_ALLOW_CREDENTIALS = True  # Required for Apollo Client with credentials: 'include'
+# CORS Configuration
+ALLOWED_ORIGINS_ENV = env.str("ALLOWED_ORIGINS", default="")
+if ALLOWED_ORIGINS_ENV:
+    CORS_ALLOWED_ORIGINS = [
+        origin.strip() 
+        for origin in ALLOWED_ORIGINS_ENV.split(",") 
+        if origin.strip()
+    ]
+else:
+    CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=[])
+
+CORS_ALLOW_ALL_ORIGINS = DEBUG and not CORS_ALLOWED_ORIGINS
+CORS_ALLOW_CREDENTIALS = True
 
 # Channels
 CHANNEL_LAYERS = {

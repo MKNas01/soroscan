@@ -1,4 +1,10 @@
 {
+  "private": true,
+  "workspaces": [
+    "soroscan-frontend",
+    "django-backend",
+    "sdk/typescript"
+  ],
   "dependencies": {
     "recharts": "^3.8.1"
   }

@@ -1363,9 +1363,15 @@ def ingest_latest_events() -> int:
 
     finally:
         # Always record duration, even if an exception occurred.
+        elapsed = time.monotonic() - _start
         m.task_duration_seconds.labels(
             task_name="ingest_latest_events"
-        ).observe(time.monotonic() - _start)
+        ).observe(elapsed)
+
+        # Calculate and record ingestion rate
+        if elapsed > 0:
+            rate = new_events / elapsed
+            m.current_ingestion_rate_gauge.labels(network=_network_label()).set(rate)
 
     return new_events
 
